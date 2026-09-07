@@ -1,0 +1,71 @@
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# CRETOP automation - local data
+# ==========================================
+
+# Browser profile
+chrome_profile/
+
+# Generated output
+output/
+
+# Popup/debug dumps
+popup_dumps/
+popup_dumps_ct2/
+
+# ==========================================
+# Test / temporary artifacts
+# ==========================================
+
+# Saved HTML/debug pages
+search_card_*.html
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Screenshots
+screenshots/
+
+# Downloads
+downloads/
+
+# ==========================================
+# IDE
+# ==========================================
+
+.vscode/
+.idea/
+
+# ==========================================
+# OS
+# ==========================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Environment / secrets
+# ==========================================
+
+.env
+.env.*
+!.env.example
