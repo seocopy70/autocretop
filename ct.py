@@ -98,13 +98,19 @@ FINANCIAL_YEARS = [
 
 DEFAULT_FINANCIAL_UNIT = "백만원"
 
-DETAIL_WAIT_MS = 500
+DETAIL_WAIT_MS = 150
+
+
+class ManualInterventionTimeout(Exception):
+    """팝업 수동 처리 시간 초과 — 수집 중단"""
+    pass
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def human_delay(min_ms=80, max_ms=280):
-    """규칙적 패턴을 피하기 위한 짧은 랜덤 대기 (전체 속도는 크게 늘리지 않음)"""
+def human_delay(min_ms=20, max_ms=60):
+    """짧은 랜덤 대기 (속도 우선, 최소만)"""
 
     delay = random.uniform(min_ms, max_ms) / 1000.0
     time.sleep(delay)
@@ -140,283 +146,144 @@ def is_page_expired(page):
 def dismiss_blocking_popups(page, context=""):
 
     """
-    정보제공 거부 / 페이지 만료 등 팝업 닫기.
-    - 확인/닫기 문구 버튼
-    - X(아이콘) 닫기 버튼
+    알려진 차단 팝업만 닫는다.
+    정보제공중지 → 확인(우선) / 팝업닫기
+    동시접속 초과 → 자동 클릭 안 함
     """
-
-    def _click_btn(btn, label):
-
-        human_delay(30, 80)
-
-        try:
-            btn.click(timeout=3000)
-        except Exception:
-            btn.click(force=True, timeout=3000)
-
-        msg = f"차단 팝업 닫음: '{label}'"
-        if context:
-            msg = f"{context} {msg}"
-        print(f"    ✓ {msg}")
-
-        page.wait_for_timeout(
-            random.randint(250, 450)
-        )
-        return True
-
-    button_texts = [
-        "확인",
-        "닫기",
-        "OK",
-        "Ok",
-        "예",
-        "동의",
-        "계속",
-        "재검색",
-        "돌아가기",
-    ]
-
-    # 1) X / close 아이콘 버튼 (텍스트 비어 있는 경우 많음)
-    close_selectors = [
-        ".modals-container button.btn.ico",
-        ".modals-container .close-layer-24",
-        ".modals-container i.close",
-        ".modals-container [class*='close']",
-        ".layer_popup button.btn.ico",
-        ".layer_popup [class*='close']",
-        ".popup [class*='close']",
-        ".modal [class*='close']",
-        "[role='dialog'] [class*='close']",
-        ".info-toast [class*='close']",
-        "button.close",
-        "[aria-label='닫기']",
-        "[aria-label='close']",
-        "[title='닫기']",
-        "[title='close']",
-    ]
 
     try:
 
-        for sel in close_selectors:
-
-            try:
-
-                locs = page.locator(sel)
-                count = min(locs.count(), 10)
-
-            except Exception:
-                continue
-
-            for i in range(count):
-
-                el = locs.nth(i)
-
-                try:
-
-                    if not el.is_visible():
-                        continue
-
-                    # i 아이콘이면 부모 button 클릭
-                    tag = el.evaluate(
-                        "(e) => e.tagName"
-                    )
-
-                    btn = el
-
-                    if tag != "BUTTON":
-
-                        parent = el.locator(
-                            "xpath=ancestor::button[1]"
-                        )
-
-                        if parent.count() > 0:
-                            btn = parent.first
-                        else:
-                            continue
-
-                    if not btn.is_visible():
-                        continue
-
-                    return _click_btn(
-                        btn,
-                        f"X/close ({sel})",
-                    )
-
-                except Exception:
-                    continue
-
-        # 2) 확인/닫기 텍스트 버튼
-        container_selectors = [
-            ".modals-container button",
-            ".modal button",
-            ".layer_popup button",
-            ".popup button",
-            ".alert button",
-            "[class*='modal'] button",
-            "[class*='popup'] button",
-            "[class*='alert'] button",
-            "[role='dialog'] button",
-            ".info-toast button",
-        ]
-
-        for sel in container_selectors:
-
-            try:
-
-                buttons = page.locator(sel)
-                count = min(buttons.count(), 15)
-
-            except Exception:
-                continue
-
-            for i in range(count):
-
-                btn = buttons.nth(i)
-
-                try:
-
-                    if not btn.is_visible():
-                        continue
-
-                    label = normalize_text(
-                        btn.inner_text()
-                    )
-                    cls = (
-                        btn.get_attribute("class")
-                        or ""
-                    ).lower()
-
-                    hit = any(
-                        t in label
-                        for t in button_texts
-                    )
-
-                    # 텍스트 없고 close/ico 클래스면 X 버튼
-                    if not hit and not label:
-
-                        if (
-                            "close" in cls
-                            or "ico" in cls
-                        ):
-                            hit = True
-                            label = "X"
-
-                    if not hit:
-                        continue
-
-                    return _click_btn(btn, label)
-
-                except Exception:
-                    continue
-
-        # 3) role=button 이름 매칭
-        for t in button_texts:
-
-            try:
-
-                loc = page.get_by_role(
-                    "button",
-                    name=t,
-                    exact=True,
-                )
-
-                if loc.count() == 0:
-                    continue
-
-                btn = loc.first
-
-                if not btn.is_visible():
-                    continue
-
-                return _click_btn(btn, t)
-
-            except Exception:
-                continue
-
-        # 4) 본문에 정보제공 거부 문구가 보이면 JS로 닫기 시도
+        # Playwright로 정보제공중지 확인 버튼 직접 클릭 (가장 확실)
         try:
 
-            body = normalize_text(
-                page.locator("body").inner_text()
+            modal = page.locator(
+                ".pop-area.PLCM910P1, "
+                ".modals-container [role='dialog'], "
+                "[role='dialog'][aria-modal='true']"
             )
 
-            if any(
-                k in body
-                for k in [
-                    "정보제공",
-                    "제공 거부",
-                    "제공거부",
-                    "제공할 수 없",
-                    "열람할 수 없",
-                ]
-            ):
+            for i in range(min(modal.count(), 5)):
 
-                js_closed = page.evaluate(
-                    """() => {
-                        const roots = document.querySelectorAll(
-                            '.modals-container, .modal, .layer_popup, .popup, [role=dialog], .info-toast'
-                        );
-                        for (const root of roots) {
-                            const style = window.getComputedStyle(root);
-                            if (style.display === 'none' || style.visibility === 'hidden') continue;
-                            // X / close
-                            const closes = root.querySelectorAll(
-                                'button, [class*=close], i.close, i.close-layer-24'
-                            );
-                            for (const el of closes) {
-                                const btn = el.tagName === 'BUTTON' ? el : el.closest('button');
-                                if (!btn) continue;
-                                const r = btn.getBoundingClientRect();
-                                if (r.width < 2 || r.height < 2) continue;
-                                btn.click();
-                                return true;
-                            }
-                            // 확인
-                            for (const btn of root.querySelectorAll('button')) {
-                                const t = (btn.innerText || '').trim();
-                                if (['확인','닫기','OK'].includes(t)) {
-                                    btn.click();
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    }"""
-                )
+                root = modal.nth(i)
 
-                if js_closed:
+                try:
+                    if not root.is_visible():
+                        continue
+                except Exception:
+                    continue
 
-                    print(
-                        f"    ✓ {(context + ' ') if context else ''}정보제공 팝업 JS 닫음"
+                t = ""
+                try:
+                    t = normalize_text(root.inner_text())
+                except Exception:
+                    continue
+
+                if not any(
+                    k in t
+                    for k in [
+                        "정보제공중지",
+                        "정보가 공개되지",
+                        "제공중지",
+                        "제공 중지",
+                        "제공거부",
+                    ]
+                ):
+                    continue
+
+                for label in ("확인", "팝업닫기"):
+
+                    btn = root.locator(
+                        "button",
+                        has_text=label,
                     )
-                    page.wait_for_timeout(
-                        random.randint(250, 450)
-                    )
-                    return True
+
+                    for j in range(min(btn.count(), 3)):
+
+                        b = btn.nth(j)
+
+                        try:
+                            if normalize_text(b.inner_text()) != label:
+                                continue
+                            if not b.is_visible():
+                                continue
+                            b.click(timeout=3000)
+                        except Exception:
+                            try:
+                                b.click(force=True, timeout=3000)
+                            except Exception:
+                                continue
+
+                        msg = f"정보제공중지 닫음: '{label}'"
+                        if context:
+                            msg = f"{context} {msg}"
+                        print(f"    ✓ {msg}")
+
+                        page.wait_for_timeout(
+                            random.randint(200, 350)
+                        )
+                        return True
 
         except Exception:
             pass
+
+        # JS 백업
+        result = page.evaluate(
+            """() => {
+                function norm(s) {
+                    return (s || '').replace(/\\s+/g, ' ').trim();
+                }
+                const roots = document.querySelectorAll(
+                    '.pop-area.PLCM910P1, .modals-container [role=dialog], [role=dialog][aria-modal=true], .pop-alert-close'
+                );
+                for (const root of roots) {
+                    if (root.closest('.quick-wrap, .quick-view')) continue;
+                    const style = window.getComputedStyle(root);
+                    const r = root.getBoundingClientRect();
+                    if (style.display === 'none' || r.width < 40) continue;
+                    const text = norm(root.innerText);
+                    if (/정보제공중지|정보가 공개되지|제공.?중지|제공.?거부/.test(text)) {
+                        for (const prefer of ['확인', '팝업닫기']) {
+                            for (const b of root.querySelectorAll('button')) {
+                                if (norm(b.innerText) === prefer) {
+                                    b.click();
+                                    return {ok: true, kind: 'info_stop', text: prefer};
+                                }
+                            }
+                        }
+                    }
+                    if (/동시접속자|기존 이용자를 종료/.test(text)) {
+                        return {ok: false, kind: 'concurrent_login', text: text.slice(0, 80)};
+                    }
+                }
+                return {ok: false, kind: null};
+            }"""
+        )
+
+        if result and result.get("ok"):
+
+            msg = (
+                f"정보제공중지 닫음: '{result.get('text')}'"
+            )
+            if context:
+                msg = f"{context} {msg}"
+            print(f"    ✓ {msg}")
+            page.wait_for_timeout(random.randint(200, 350))
+            return True
+
+        if result and result.get("kind") == "concurrent_login":
+
+            print(
+                f"    ⚠ {(context + ' ') if context else ''}"
+                f"동시접속 팝업 감지 (자동 닫기 안 함)"
+            )
+            return False
 
     except Exception:
         pass
 
     return False
 
-OUTPUT_DIR = (
-    BASE_DIR
-    / "output"
-    / "cretop_final"
-)
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-
-# ============================================================
-# 공통 유틸
-# ============================================================
 
 def normalize_text(text):
     if text is None:
@@ -1244,18 +1111,16 @@ def click_general_from_card(
     except Exception:
         pass
 
-    human_delay(50, 180)
-
     try:
         link.click()
 
     except Exception:
         link.click(force=True)
 
-    for _ in range(30):
+    for _ in range(20):
 
         page.wait_for_timeout(
-            random.randint(150, 250)
+            random.randint(50, 100)
         )
 
         try:
@@ -1267,9 +1132,8 @@ def click_general_from_card(
             pass
 
     page.wait_for_timeout(
-        DETAIL_WAIT_MS + random.randint(0, 200)
+        DETAIL_WAIT_MS + random.randint(0, 80)
     )
-    human_delay(60, 200)
 
     if "ETGN" not in page.url:
 
@@ -2181,17 +2045,10 @@ def force_restore_search_list(
     target_page=1,
 ):
 
-    """
-    go_back 에 의존하지 않고
-    저장해 둔 검색 URL + 페이지 번호로 강제 복구.
-    (정보제공중지 닫은 뒤 스마트검색 첫 화면으로 떨어지는 문제 대응)
-    """
+    """검색 URL + 페이지로 강제 복구 (빠른 경로)"""
 
     if not search_url:
-
-        print(
-            "    ⚠ 검색 URL이 없어 강제 복구 불가"
-        )
+        print("    ⚠ 검색 URL이 없어 강제 복구 불가")
         return False
 
     print(
@@ -2200,161 +2057,70 @@ def force_restore_search_list(
     )
 
     try:
-
         page.goto(
             search_url,
             wait_until="domcontentloaded",
-            timeout=30000,
+            timeout=20000,
         )
-
     except Exception as e:
-
-        print(
-            f"    검색 URL 이동 실패: {e}"
-        )
+        print(f"    검색 URL 이동 실패: {e}")
         return False
 
-    page.wait_for_timeout(
-        random.randint(600, 1000)
-    )
-
-    dismiss_blocking_popups(
-        page,
-        context="강제복구",
-    )
-
-    if not has_search_result_list(
-        page,
-        timeout_ms=15000,
-    ):
-
-        print(
-            "    ⚠ 강제 복구 후에도 검색목록 없음"
+    try:
+        page.wait_for_selector(
+            "ul.search-result__list > li",
+            timeout=8000,
         )
+    except Exception:
+        print("    ⚠ 강제 복구 후에도 검색목록 없음")
         return False
+
+    page.wait_for_timeout(random.randint(80, 150))
+
+    # 정보제공중지 등만 처리 (일반 닫기 안 함)
+    dismiss_blocking_popups(page, context="강제복구")
 
     if target_page and target_page > 1:
-
-        _wait_list_stable(page)
-        ok = _goto_page_number(
-            page,
-            target_page,
-        )
-
-        if not ok:
-
+        ok = _goto_page_number(page, target_page)
+        if ok:
+            print(f"    ✓ {target_page}페이지 복구 완료")
+        else:
             print(
                 f"    ⚠ {target_page}페이지 맞춤 실패 "
                 f"(현재 목록에서 계속)"
             )
-
-        else:
-
-            print(
-                f"    ✓ {target_page}페이지 복구 완료"
-            )
-
-    else:
-
-        _wait_list_stable(page)
 
     return True
 
 
 def ensure_search_list(page, search_url="", target_page=1):
 
-    """
-    검색결과 목록이 보이도록 보장.
-    만료/정보제공중지/목록없음 → 검색 URL 강제 복구.
-    """
+    """목록 없으면 강제 복구. 정상 목록이면 즉시 통과."""
 
-    dismiss_blocking_popups(
-        page,
-        context="목록확인",
-    )
+    # 목록이 보이면 바로 OK (불필요한 dismiss/대기 제거)
+    if has_search_result_list(page, timeout_ms=800):
 
-    need_force = False
+        active = _get_active_page_number(page)
 
-    if is_page_expired(page):
+        if (
+            target_page
+            and active
+            and active != target_page
+        ):
+            _goto_page_number(page, target_page)
 
-        print(
-            "    ⚠ 페이지 만료 감지"
-        )
-        need_force = True
+        return True
 
     if is_info_provision_blocked(page):
-
-        print(
-            "    ⚠ 정보제공중지 안내 감지"
-        )
         dismiss_blocking_popups(
-            page,
-            context="정보제공중지",
+            page, context="정보제공중지"
         )
-        need_force = True
 
-    # 스마트검색 첫 화면 등 (목록 없음)
-    if not has_search_result_list(
+    return force_restore_search_list(
         page,
-        timeout_ms=2500,
-    ):
-
-        print(
-            "    ⚠ 검색목록 카드 없음"
-        )
-        need_force = True
-
-    # URL이 검색결과 경로가 아닌 경우
-    try:
-
-        url = page.url or ""
-
-        if search_url and "ETSS" in search_url:
-
-            if "ETSS" not in url:
-
-                print(
-                    "    ⚠ 검색결과 URL이 아님"
-                )
-                need_force = True
-
-    except Exception:
-        pass
-
-    if need_force:
-
-        return force_restore_search_list(
-            page,
-            search_url=search_url,
-            target_page=target_page,
-        )
-
-    # 목록은 있는데 페이지 번호만 맞춤
-    active = _get_active_page_number(page)
-
-    if (
-        target_page
-        and active
-        and active != target_page
-    ):
-
-        print(
-            f"    목록 페이지 맞춤: "
-            f"{active} → {target_page}"
-        )
-        _goto_page_number(
-            page,
-            target_page,
-        )
-
-    elif target_page and target_page > 1 and active is None:
-
-        _goto_page_number(
-            page,
-            target_page,
-        )
-
-    return True
+        search_url=search_url,
+        target_page=target_page,
+    )
 
 
 def return_to_search(
@@ -2365,70 +2131,48 @@ def return_to_search(
 ):
 
     """
-    상세 → 검색목록 복귀.
-    force=True 이거나 go_back 후 목록이 아니면
-    저장 URL로 강제 복구 (스마트검색 홈으로 떨어지는 것 방지).
+    상세 → 검색목록 복귀 (빠른 경로).
+    정상 시 go_back 후 목록만 확인. 팝업 닫기 호출 안 함.
     """
 
-    print(
-        "    검색결과 페이지로 복귀 중..."
-    )
-
-    human_delay(40, 160)
-
     if force:
-
         ok = force_restore_search_list(
             page,
             search_url=search_url,
             target_page=target_page,
         )
-
         if ok:
-
-            print(
-                "    ✓ 검색결과 페이지 복귀 완료 (강제)"
-            )
-
+            print("    ✓ 검색목록 복귀 (강제)")
         return ok
 
-    # 1차: go_back
     try:
-
         page.go_back(
             wait_until="domcontentloaded",
-            timeout=15000,
+            timeout=10000,
         )
-
     except Exception as e:
-
-        print(
-            f"    go_back 실패: {e}"
+        print(f"    go_back 실패: {e}")
+        return force_restore_search_list(
+            page,
+            search_url=search_url,
+            target_page=target_page,
         )
 
-    page.wait_for_timeout(
-        200 + random.randint(100, 300)
-    )
+    # 목록이 빨리 보이면 끝
+    if has_search_result_list(page, timeout_ms=2500):
+        return True
 
-    dismiss_blocking_popups(
-        page,
-        context="복귀",
-    )
+    # 정보제공중지 모달만 닫기 시도
+    dismiss_blocking_popups(page, context="복귀")
 
-    # go_back 결과가 목록이 아니면 강제 복구
-    ensure_search_list(
+    if has_search_result_list(page, timeout_ms=1000):
+        return True
+
+    return force_restore_search_list(
         page,
         search_url=search_url,
         target_page=target_page,
     )
-
-    human_delay(50, 180)
-
-    print(
-        "    ✓ 검색결과 페이지 복귀 완료"
-    )
-
-    return True
 
 
 def _goto_page_number(page, target_page):
@@ -2439,16 +2183,15 @@ def _goto_page_number(page, target_page):
     active = _get_active_page_number(page)
 
     if active == target_page:
-        _wait_list_stable(page)
         return True
 
-    # 현재 목록 안정화 후 클릭
-    _wait_list_stable(page)
+    # 클릭 전 짧은 안정화만
+    _wait_list_stable(page, checks=2, interval_ms=50)
 
     old_sig = get_current_page_signature(page)
 
     _scroll_to_pagination(page)
-    human_delay(40, 100)
+    human_delay(20, 50)
 
     # 1) Vue 이벤트 클릭 우선
     try:
@@ -2625,10 +2368,10 @@ def process_company(
 
         blocked = False
 
-        for _ in range(8):
+        for _ in range(3):
 
             page.wait_for_timeout(
-                random.randint(120, 220)
+                random.randint(50, 90)
             )
 
             if is_info_provision_blocked(page):
@@ -2689,55 +2432,84 @@ def process_company(
 
         if blocked:
 
+            print()
             print(
-                "    ⚠ 정보제공중지 안내 감지 "
-                "(일반상세 진입 직후)"
+                "    ⚠ 정보제공중지 안내 팝업"
+            )
+            print(
+                "    → 브라우저에서 [확인] 을 "
+                "직접 눌러 주세요."
+            )
+            print(
+                "    → 2초 안에 닫히지 않으면 "
+                "수집을 중단합니다."
             )
 
-            # 1) 팝업 먼저 닫기
-            closed = dismiss_blocking_popups(
-                page,
-                context="정보제공중지",
-            )
-
-            if not closed:
-
-                # X / 확인 한 번 더
-                dismiss_blocking_popups(
-                    page,
-                    context="정보제공중지재시도",
-                )
-
-            page.wait_for_timeout(
-                random.randint(200, 400)
-            )
-
-            result[
-                "AI_판정"
-            ] = "F_판단보류"
-
-            result[
-                "코멘트"
-            ] = (
+            result["AI_판정"] = "F_판단보류"
+            result["코멘트"] = (
                 "정보제공중지 안내로 "
                 "상세 정보를 확인할 수 없습니다."
             )
+            result["처리상태"] = "오류"
 
-            result[
-                "처리상태"
-            ] = "오류"
+            # 자동 클릭 없이 수동 닫기 대기 (약 2초)
+            closed_by_user = False
 
-            # 2) 그 다음 검색리스트(해당 페이지)로 복귀
+            for _ in range(20):
+
+                page.wait_for_timeout(100)
+
+                if not is_info_provision_blocked(page):
+                    closed_by_user = True
+                    break
+
+            if not closed_by_user:
+
+                print()
+                print(
+                    "    ❌ 수동 처리 시간 초과 — "
+                    "수집을 중단합니다."
+                )
+                print(
+                    "    팝업을 닫고 검색리스트가 "
+                    "보이는 상태에서 "
+                    "이어하기 하세요."
+                )
+                raise ManualInterventionTimeout(
+                    "정보제공중지 팝업 수동 처리 시간 초과"
+                )
+
             print(
-                "    → 검색리스트로 복귀합니다"
+                "    ✓ 팝업이 닫힌 것을 확인"
             )
 
-            return_to_search(
+            # 목록 있으면 그대로, 없으면 강제 복구 1회만 시도
+            if has_search_result_list(
+                page, timeout_ms=1500
+            ):
+                print(
+                    "    ✓ 검색리스트 유지"
+                )
+                return result
+
+            print(
+                "    → 검색리스트 복구 시도"
+            )
+            ok = force_restore_search_list(
                 page,
                 search_url=search_url,
                 target_page=page_number,
-                force=True,
             )
+
+            if not ok:
+
+                print(
+                    "    ❌ 리스트 복구 실패 — "
+                    "수집을 중단합니다."
+                )
+                raise ManualInterventionTimeout(
+                    "정보제공중지 후 검색리스트 복구 실패"
+                )
 
             return result
 
@@ -3277,23 +3049,23 @@ def _get_active_page_number(page):
     return None
 
 
-def _wait_list_stable(page, checks=3, interval_ms=250):
+def _wait_list_stable(page, checks=2, interval_ms=50):
 
     """
-    목록 시그니처가 연속으로 동일하면 렌더 완료로 판단.
-    (페이지 이동 직후 바로 다음 클릭하면 Vue가 무시하는 문제 방지)
+    목록 시그니처가 연속 동일하면 렌더 완료로 판단.
+    기본 짧게 (약 0.2~0.4초). 페이지 클릭 직전에만 사용.
     """
 
     prev = None
     same = 0
 
-    for _ in range(checks + 6):
+    for _ in range(checks + 3):
 
         try:
 
             page.wait_for_selector(
                 "ul.search-result__list > li",
-                timeout=3000,
+                timeout=2000,
             )
 
         except Exception:
@@ -3320,15 +3092,15 @@ def _wait_list_stable(page, checks=3, interval_ms=250):
 def _wait_for_page_number(
     page,
     target_page,
-    timeout_ms=12000,
+    timeout_ms=10000,
     old_signature=None,
 ):
 
     """
-    이동 성공 판정 (둘 다 만족해야 함):
+    이동 성공 판정:
     1) button.num.on == 목표 페이지
-    2) old_signature 가 있으면 목록 시그니처가 실제로 바뀜
-    그 후 목록이 안정될 때까지 대기
+    2) old_signature 가 있으면 목록 시그니처 변경
+    성공 후 짧은 정착만 (풀 안정화 중복 제거)
     """
 
     target_text = str(target_page)
@@ -3343,7 +3115,6 @@ def _wait_for_page_number(
             )
 
             active_ok = False
-            label = ""
 
             if active.count() > 0:
 
@@ -3355,14 +3126,12 @@ def _wait_for_page_number(
             if not active_ok:
 
                 try:
-                    page.wait_for_timeout(200)
+                    page.wait_for_timeout(150)
                 except Exception:
                     return False
 
                 continue
 
-            # 활성 번호는 목표와 일치
-            # 시그니처 변경 확인 (이전 값이 있을 때)
             if old_signature:
 
                 new_sig = get_current_page_signature(
@@ -3375,14 +3144,19 @@ def _wait_for_page_number(
                 ):
 
                     try:
-                        page.wait_for_timeout(200)
+                        page.wait_for_timeout(150)
                     except Exception:
                         return False
 
                     continue
 
-            # 목록 안정화까지 기다림
-            _wait_list_stable(page)
+            # 성공 후 짧은 정착만
+            try:
+                page.wait_for_timeout(
+                    random.randint(100, 200)
+                )
+            except Exception:
+                pass
 
             return True
 
@@ -3500,12 +3274,8 @@ def go_to_next_page(
         context="페이지이동전",
     )
 
-    # 현재 목록이 안정된 뒤에만 다음 페이지 클릭
-    # (2페이지 직후 3 클릭이 무시되던 원인 대응)
-    print(
-        "    목록 안정화 대기..."
-    )
-    _wait_list_stable(page)
+    # 클릭 전 짧은 안정화만 (2→3 무시 방지)
+    _wait_list_stable(page, checks=2, interval_ms=50)
 
     _scroll_to_pagination(page)
 
@@ -4837,9 +4607,30 @@ def main():
             current_page_number += 1
 
             page.wait_for_timeout(
-                200 + random.randint(0, 250)
+                random.randint(50, 120)
             )
-            human_delay(80, 250)
+
+        except ManualInterventionTimeout as pause_err:
+
+            interrupted = True
+            print()
+            print(
+                f"⚠ 수동 처리 필요: {pause_err}"
+            )
+            print(
+                "지금까지 수집한 데이터를 저장합니다."
+            )
+            print(
+                "팝업을 닫고 검색리스트를 연 뒤 "
+                "이어하기 하세요."
+            )
+            print(
+                f"  이어하기 예: "
+                f"python ct.py "
+                f"--start-page {current_page_number} "
+                f"--start-card 1 "
+                f"--processed-count {processed_count}"
+            )
 
         except KeyboardInterrupt:
 
