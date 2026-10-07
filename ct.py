@@ -57,6 +57,7 @@ from openpyxl.utils import get_column_letter
 # - 종합결과
 # - 재무정보
 # - 검색정보
+# - E~F등급
 #
 # JSON
 # - 전체 분석 결과 저장
@@ -99,6 +100,7 @@ FINANCIAL_YEARS = [
 DEFAULT_FINANCIAL_UNIT = "백만원"
 
 DETAIL_WAIT_MS = 150
+MANUAL_PAGE_CHANGE_TIMEOUT_SECONDS = 60
 
 
 class ManualInterventionTimeout(Exception):
@@ -107,6 +109,8 @@ class ManualInterventionTimeout(Exception):
 
 
 BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def human_delay(min_ms=20, max_ms=60):
@@ -147,7 +151,7 @@ def dismiss_blocking_popups(page, context=""):
 
     """
     알려진 차단 팝업만 닫는다.
-    정보제공중지 → 확인(우선) / 팝업닫기
+    정보제공중지 → 팝업 내부 확인 버튼 일반 클릭
     동시접속 초과 → 자동 클릭 안 함
     """
 
@@ -190,7 +194,7 @@ def dismiss_blocking_popups(page, context=""):
                 ):
                     continue
 
-                for label in ("확인", "팝업닫기"):
+                for label in ("확인",):
 
                     btn = root.locator(
                         "button",
@@ -208,10 +212,7 @@ def dismiss_blocking_popups(page, context=""):
                                 continue
                             b.click(timeout=3000)
                         except Exception:
-                            try:
-                                b.click(force=True, timeout=3000)
-                            except Exception:
-                                continue
+                            continue
 
                         msg = f"정보제공중지 닫음: '{label}'"
                         if context:
@@ -241,16 +242,6 @@ def dismiss_blocking_popups(page, context=""):
                     const r = root.getBoundingClientRect();
                     if (style.display === 'none' || r.width < 40) continue;
                     const text = norm(root.innerText);
-                    if (/정보제공중지|정보가 공개되지|제공.?중지|제공.?거부/.test(text)) {
-                        for (const prefer of ['확인', '팝업닫기']) {
-                            for (const b of root.querySelectorAll('button')) {
-                                if (norm(b.innerText) === prefer) {
-                                    b.click();
-                                    return {ok: true, kind: 'info_stop', text: prefer};
-                                }
-                            }
-                        }
-                    }
                     if (/동시접속자|기존 이용자를 종료/.test(text)) {
                         return {ok: false, kind: 'concurrent_login', text: text.slice(0, 80)};
                     }
@@ -258,17 +249,6 @@ def dismiss_blocking_popups(page, context=""):
                 return {ok: false, kind: null};
             }"""
         )
-
-        if result and result.get("ok"):
-
-            msg = (
-                f"정보제공중지 닫음: '{result.get('text')}'"
-            )
-            if context:
-                msg = f"{context} {msg}"
-            print(f"    ✓ {msg}")
-            page.wait_for_timeout(random.randint(200, 350))
-            return True
 
         if result and result.get("kind") == "concurrent_login":
 
@@ -1134,6 +1114,10 @@ def click_general_from_card(
     page.wait_for_timeout(
         DETAIL_WAIT_MS + random.randint(0, 80)
     )
+
+    if is_info_provision_blocked(page):
+        print("    정보제공중지 안내 감지: 팝업 처리 경로로 넘깁니다.")
+        return
 
     if "ETGN" not in page.url:
 
@@ -2007,7 +1991,9 @@ def is_info_provision_blocked(page):
         )
 
         keywords = [
+            "정보제공중지 안내",
             "정보제공중지",
+            "정보가 공개되지",
             "정보제공 중지",
             "정보 제공 중지",
             "정보제공거부",
@@ -2437,12 +2423,7 @@ def process_company(
                 "    ⚠ 정보제공중지 안내 팝업"
             )
             print(
-                "    → 브라우저에서 [확인] 을 "
-                "직접 눌러 주세요."
-            )
-            print(
-                "    → 2초 안에 닫히지 않으면 "
-                "수집을 중단합니다."
+                "    → 팝업 안의 [확인] 버튼을 클릭합니다."
             )
 
             result["AI_판정"] = "F_판단보류"
@@ -2450,68 +2431,29 @@ def process_company(
                 "정보제공중지 안내로 "
                 "상세 정보를 확인할 수 없습니다."
             )
-            result["처리상태"] = "오류"
+            result["처리상태"] = "정보제공중지"
 
-            # 자동 클릭 없이 수동 닫기 대기 (약 2초)
-            closed_by_user = False
-
-            for _ in range(20):
-
-                page.wait_for_timeout(100)
-
-                if not is_info_provision_blocked(page):
-                    closed_by_user = True
-                    break
-
-            if not closed_by_user:
-
-                print()
-                print(
-                    "    ❌ 수동 처리 시간 초과 — "
-                    "수집을 중단합니다."
-                )
-                print(
-                    "    팝업을 닫고 검색리스트가 "
-                    "보이는 상태에서 "
-                    "이어하기 하세요."
-                )
-                raise ManualInterventionTimeout(
-                    "정보제공중지 팝업 수동 처리 시간 초과"
-                )
-
-            print(
-                "    ✓ 팝업이 닫힌 것을 확인"
-            )
-
-            # 목록 있으면 그대로, 없으면 강제 복구 1회만 시도
-            if has_search_result_list(
-                page, timeout_ms=1500
-            ):
-                print(
-                    "    ✓ 검색리스트 유지"
-                )
-                return result
-
-            print(
-                "    → 검색리스트 복구 시도"
-            )
-            ok = force_restore_search_list(
+            if not dismiss_blocking_popups(
                 page,
-                search_url=search_url,
-                target_page=page_number,
-            )
-
-            if not ok:
-
-                print(
-                    "    ❌ 리스트 복구 실패 — "
-                    "수집을 중단합니다."
-                )
+                context="정보제공중지",
+            ):
                 raise ManualInterventionTimeout(
-                    "정보제공중지 후 검색리스트 복구 실패"
+                    "정보제공중지 팝업의 확인 버튼을 클릭하지 못했습니다."
                 )
 
-            return result
+            for _ in range(30):
+                if (
+                    not is_info_provision_blocked(page)
+                    and has_search_result_list(page, timeout_ms=100)
+                ):
+                    print("    ✓ 검색목록 복귀 확인")
+                    return result
+
+                page.wait_for_timeout(150)
+
+            raise ManualInterventionTimeout(
+                "정보제공중지 확인 후 검색목록 복귀를 확인하지 못했습니다."
+            )
 
         # 중지 안내가 없을 때만 일반·재무 수집
         dismiss_blocking_popups(
@@ -2885,6 +2827,12 @@ def collect_current_page(
                     "    → 제외 처리 완료"
                 )
 
+            elif status == "정보제공중지":
+
+                print(
+                    "    → 정보제공중지로 상세정보 건너뜀"
+                )
+
             elif status == "오류":
 
                 print(
@@ -2910,6 +2858,9 @@ def collect_current_page(
                 processed_companies.add(
                     result_company_name
                 )
+
+        except (KeyboardInterrupt, ManualInterventionTimeout):
+            raise
 
         except Exception as e:
 
@@ -3747,8 +3698,22 @@ def save_to_excel(
 
     export_rows.sort(key=lambda x: x["rank"])
 
+    low_grade_rows = [
+        row
+        for row in export_rows
+        if row["values"][1] in {
+            "E_위험",
+            "F_판단보류",
+        }
+    ]
+
     for row in export_rows:
-        ws.append(row["values"])
+
+        if row["values"][1] not in {
+            "E_위험",
+            "F_판단보류",
+        }:
+            ws.append(row["values"])
 
     style_worksheet(ws)
 
@@ -3801,6 +3766,12 @@ def save_to_excel(
         )
 
         judgment = item.get("AI_판정", "F_판단보류")
+
+        if judgment in {
+            "E_위험",
+            "F_판단보류",
+        }:
+            continue
 
         financial_rows = item.get(
             "재무정보",
@@ -3916,12 +3887,30 @@ def save_to_excel(
     ].width = 100
 
     # ========================================================
+    # E~F등급 목록
+    # ========================================================
+
+    low_grade_ws = wb.create_sheet(
+        "E~F등급"
+    )
+
+    low_grade_ws.append(headers)
+
+    for row in low_grade_rows:
+        low_grade_ws.append(row["values"])
+
+    style_worksheet(
+        low_grade_ws
+    )
+
+    # ========================================================
     # 전화번호 등 텍스트 형식
     # ========================================================
 
     for target_ws in [
         ws,
         finance_ws,
+        low_grade_ws,
     ]:
 
         header_index = {}
@@ -3966,41 +3955,46 @@ def save_to_excel(
 
     # 종합결과 숫자 컬럼
 
-    result_header_index = {}
-
-    for col in range(
-        1,
-        ws.max_column + 1,
-    ):
-
-        result_header_index[
-            ws.cell(
-                1,
-                col,
-            ).value
-        ] = col
-
-    for column_name in [
-        "2025_매출",
-        "2025_영업이익",
-        "2025_순이익",
+    for target_ws in [
+        ws,
+        low_grade_ws,
     ]:
 
-        col = result_header_index.get(
-            column_name
-        )
+        result_header_index = {}
 
-        if col:
+        for col in range(
+            1,
+            target_ws.max_column + 1,
+        ):
 
-            for row in range(
-                2,
-                ws.max_row + 1,
-            ):
-
-                ws.cell(
-                    row,
+            result_header_index[
+                target_ws.cell(
+                    1,
                     col,
-                ).number_format = "#,##0"
+                ).value
+            ] = col
+
+        for column_name in [
+            "2025_매출",
+            "2025_영업이익",
+            "2025_순이익",
+        ]:
+
+            col = result_header_index.get(
+                column_name
+            )
+
+            if col:
+
+                for row in range(
+                    2,
+                    target_ws.max_row + 1,
+                ):
+
+                    target_ws.cell(
+                        row,
+                        col,
+                    ).number_format = "#,##0"
 
     # 재무정보 숫자 (AI_판정 제외)
 
@@ -4579,36 +4573,53 @@ def main():
 
                 break
 
-            # ------------------------------------------------
-            # 다음 페이지
-            # ------------------------------------------------
+            target_page = current_page_number + 1
+            old_signature = get_current_page_signature(page)
+            deadline = time.monotonic() + MANUAL_PAGE_CHANGE_TIMEOUT_SECONDS
 
-            moved = (
-                go_to_next_page(
-                    page,
-                    current_page_number,
-                    search_url=search_url,
-                )
+            print(
+                f"현재 페이지 처리를 완료했습니다. Chrome에서 직접 "
+                f"{target_page}페이지로 이동해 주세요. "
+                f"최대 {MANUAL_PAGE_CHANGE_TIMEOUT_SECONDS}초 기다립니다."
             )
 
-            if not moved:
+            moved_manually = False
 
-                print()
-                print(
-                    "❌ 다음 페이지로 이동하지 못했습니다."
-                )
+            while time.monotonic() < deadline:
 
-                print(
-                    "현재까지 수집한 데이터를 저장합니다."
-                )
+                if is_page_expired(page):
+                    print("페이지 만료를 감지했습니다. 현재 결과를 저장하고 종료합니다.")
+                    interrupted = True
+                    break
 
+                active_page = _get_active_page_number(page)
+                page_signature = get_current_page_signature(page)
+
+                if (
+                    active_page == target_page
+                    and page_signature
+                    and page_signature != old_signature
+                ):
+                    if _wait_list_stable(page, checks=2, interval_ms=150):
+                        current_page_number = target_page
+                        moved_manually = True
+                        print(f"✓ 수동으로 {target_page}페이지 이동 확인")
+                        break
+
+                page.wait_for_timeout(300)
+
+            if interrupted:
                 break
 
-            current_page_number += 1
+            if moved_manually:
+                continue
 
-            page.wait_for_timeout(
-                random.randint(50, 120)
+            print(
+                f"{MANUAL_PAGE_CHANGE_TIMEOUT_SECONDS}초 동안 "
+                f"{target_page}페이지 이동이 확인되지 않아 저장 후 종료합니다."
             )
+            interrupted = True
+            break
 
         except ManualInterventionTimeout as pause_err:
 
