@@ -2025,22 +2025,205 @@ def has_search_result_list(page, timeout_ms=3000):
         return False
 
 
+def save_search_restore_diagnostic(
+    page,
+    search_url,
+    target_page,
+    context,
+    failure_stage,
+    error,
+    browser_events,
+):
+
+    diagnostic_dir = OUTPUT_DIR / "diagnostics"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+    diagnostic_path = unique_output_path(
+        diagnostic_dir
+        / f"search_restore_failure_{timestamp}.json"
+    )
+    screenshot_path = diagnostic_path.with_suffix(
+        ".png"
+    )
+
+    diagnostic = {
+        "timestamp": datetime.now().isoformat(
+            timespec="milliseconds"
+        ),
+        "failure_stage": failure_stage,
+        "error": str(error) if error else "",
+        "search_url": search_url,
+        "target_page": target_page,
+        "context": context or {},
+        "page": {},
+        "selectors": {},
+        "body_text_excerpt": "",
+        "browser_events": browser_events,
+        "screenshot": None,
+    }
+
+    try:
+        diagnostic["page"]["url"] = page.url
+    except Exception as page_error:
+        diagnostic["page"]["url_error"] = str(page_error)
+
+    try:
+        diagnostic["page"]["title"] = page.title()
+    except Exception as page_error:
+        diagnostic["page"]["title_error"] = str(page_error)
+
+    try:
+        diagnostic["page"]["ready_state"] = page.evaluate(
+            "() => document.readyState"
+        )
+    except Exception as page_error:
+        diagnostic["page"]["ready_state_error"] = str(page_error)
+
+    for name, selector in {
+        "search_result_cards": "ul.search-result__list > li",
+        "pagination": "div.pagination",
+        "dialogs": '[role="dialog"], .modal, .layer_popup, .popup',
+        "body": "body",
+    }.items():
+        try:
+            diagnostic["selectors"][name] = page.locator(
+                selector
+            ).count()
+        except Exception as page_error:
+            diagnostic["selectors"][f"{name}_error"] = str(
+                page_error
+            )
+
+    try:
+        diagnostic["body_text_excerpt"] = normalize_text(
+            page.locator("body").inner_text(timeout=2000)
+        )[:3000]
+    except Exception as page_error:
+        diagnostic["page"]["body_text_error"] = str(page_error)
+
+    try:
+        page.screenshot(
+            path=str(screenshot_path),
+            full_page=True,
+            timeout=5000,
+        )
+        diagnostic["screenshot"] = screenshot_path.name
+    except Exception as screenshot_error:
+        diagnostic["screenshot_error"] = str(screenshot_error)
+
+    try:
+        diagnostic_path.write_text(
+            json.dumps(
+                diagnostic,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as write_error:
+        print(
+            f"    ❌ 검색목록 복구 진단정보 저장 실패: "
+            f"{write_error}"
+        )
+        return
+
+    print(
+        f"    진단 로그 저장: {diagnostic_path}"
+    )
+    if diagnostic["screenshot"]:
+        print(
+            f"    진단 화면 캡처: {screenshot_path}"
+        )
+
+
 def force_restore_search_list(
     page,
     search_url="",
     target_page=1,
+    diagnostic_context=None,
 ):
 
     """검색 URL + 페이지로 강제 복구 (빠른 경로)"""
 
     if not search_url:
         print("    ⚠ 검색 URL이 없어 강제 복구 불가")
+        save_search_restore_diagnostic(
+            page,
+            search_url,
+            target_page,
+            diagnostic_context,
+            "missing_search_url",
+            "검색 URL이 비어 있습니다.",
+            [],
+        )
         return False
+
+    diagnostic_context = dict(
+        diagnostic_context or {}
+    )
+    try:
+        diagnostic_context["pre_recovery_url"] = page.url
+    except Exception as page_error:
+        diagnostic_context["pre_recovery_url_error"] = str(
+            page_error
+        )
+    try:
+        diagnostic_context["pre_recovery_title"] = page.title()
+    except Exception as page_error:
+        diagnostic_context["pre_recovery_title_error"] = str(
+            page_error
+        )
+    try:
+        diagnostic_context["pre_recovery_card_count"] = page.locator(
+            "ul.search-result__list > li"
+        ).count()
+    except Exception as page_error:
+        diagnostic_context["pre_recovery_card_count_error"] = str(
+            page_error
+        )
 
     print(
         f"    → 검색목록 강제 복구 "
         f"(URL + {target_page}페이지)"
     )
+
+    browser_events = []
+
+    def record_request_failed(request):
+        browser_events.append({
+            "type": "request_failed",
+            "url": request.url,
+            "failure": request.failure,
+        })
+
+    def record_page_error(error):
+        browser_events.append({
+            "type": "page_error",
+            "message": str(error),
+        })
+
+    def record_console_error(message):
+        if message.type == "error":
+            browser_events.append({
+                "type": "console_error",
+                "text": message.text,
+            })
+
+    def record_bad_response(response):
+        if response.status >= 400:
+            browser_events.append({
+                "type": "http_response_error",
+                "status": response.status,
+                "url": response.url,
+            })
+
+    page.on("requestfailed", record_request_failed)
+    page.on("pageerror", record_page_error)
+    page.on("console", record_console_error)
+    page.on("response", record_bad_response)
 
     try:
         page.goto(
@@ -2050,6 +2233,19 @@ def force_restore_search_list(
         )
     except Exception as e:
         print(f"    검색 URL 이동 실패: {e}")
+        save_search_restore_diagnostic(
+            page,
+            search_url,
+            target_page,
+            diagnostic_context,
+            "navigation_failed",
+            e,
+            browser_events,
+        )
+        page.remove_listener("requestfailed", record_request_failed)
+        page.remove_listener("pageerror", record_page_error)
+        page.remove_listener("console", record_console_error)
+        page.remove_listener("response", record_bad_response)
         return False
 
     try:
@@ -2057,9 +2253,23 @@ def force_restore_search_list(
             "ul.search-result__list > li",
             timeout=8000,
         )
-    except Exception:
+    except Exception as e:
         print("    ⚠ 강제 복구 후에도 검색목록 없음")
+        save_search_restore_diagnostic(
+            page,
+            search_url,
+            target_page,
+            diagnostic_context,
+            "search_list_selector_timeout",
+            e,
+            browser_events,
+        )
         return False
+    finally:
+        page.remove_listener("requestfailed", record_request_failed)
+        page.remove_listener("pageerror", record_page_error)
+        page.remove_listener("console", record_console_error)
+        page.remove_listener("response", record_bad_response)
 
     page.wait_for_timeout(random.randint(80, 150))
 
@@ -2114,6 +2324,7 @@ def return_to_search(
     search_url="",
     target_page=1,
     force=False,
+    diagnostic_context=None,
 ):
 
     """
@@ -2126,6 +2337,7 @@ def return_to_search(
             page,
             search_url=search_url,
             target_page=target_page,
+            diagnostic_context=diagnostic_context,
         )
         if ok:
             print("    ✓ 검색목록 복귀 (강제)")
@@ -2142,6 +2354,7 @@ def return_to_search(
             page,
             search_url=search_url,
             target_page=target_page,
+            diagnostic_context=diagnostic_context,
         )
 
     # 목록이 빨리 보이면 끝
@@ -2158,6 +2371,7 @@ def return_to_search(
         page,
         search_url=search_url,
         target_page=target_page,
+        diagnostic_context=diagnostic_context,
     )
 
 
@@ -2565,6 +2779,13 @@ def process_company(
             page,
             search_url=search_url,
             target_page=page_number,
+            diagnostic_context={
+                "company": company_name,
+                "card_index": card_index,
+                "card_number": card_index + 1,
+                "page_number": page_number,
+                "stage": "after_financial_collection",
+            },
         )
 
         return result
@@ -2599,6 +2820,14 @@ def process_company(
                 search_url=search_url,
                 target_page=page_number,
                 force=True,
+                diagnostic_context={
+                    "company": company_name,
+                    "card_index": card_index,
+                    "card_number": card_index + 1,
+                    "page_number": page_number,
+                    "stage": "after_company_error",
+                    "company_error": str(e),
+                },
             )
 
         except Exception as return_error:
@@ -2614,6 +2843,14 @@ def process_company(
                     page,
                     search_url=search_url,
                     target_page=page_number,
+                    diagnostic_context={
+                        "company": company_name,
+                        "card_index": card_index,
+                        "card_number": card_index + 1,
+                        "page_number": page_number,
+                        "stage": "fallback_after_return_error",
+                        "return_error": str(return_error),
+                    },
                 )
 
             except Exception:
@@ -2648,6 +2885,7 @@ def collect_current_page(
     processed_companies,
     start_card_index=1,
     search_url="",
+    missing_card_failure_count=0,
 ):
 
     cards = get_search_cards(page)
@@ -2694,6 +2932,7 @@ def collect_current_page(
         return (
             [],
             processed_count,
+            missing_card_failure_count,
         )
 
     # 현재 페이지에서 실제 처리할 수 있는 회사 수
@@ -2868,6 +3107,9 @@ def collect_current_page(
                 f"    ❌ 회사 처리 실패: {e}"
             )
 
+            if "번째 카드를 찾을 수 없습니다." in str(e):
+                missing_card_failure_count += 1
+
             company_name = ""
 
             try:
@@ -2917,6 +3159,9 @@ def collect_current_page(
 
         processed_count += 1
 
+        if missing_card_failure_count >= 2:
+            break
+
         # 회사 간 짧은 랜덤 간격 (패턴 완화)
         human_delay(70, 220)
 
@@ -2941,6 +3186,7 @@ def collect_current_page(
     return (
         page_results,
         processed_count,
+        missing_card_failure_count,
     )
 
 
@@ -4442,6 +4688,7 @@ def main():
         interrupted = False
         excel_path = None
         json_path = None
+        missing_card_failure_count = 0
 
         try:
 
@@ -4499,6 +4746,7 @@ def main():
             (
                 page_data,
                 processed_count,
+                missing_card_failure_count,
             ) = collect_current_page(
                 page,
                 current_page_number,
@@ -4507,11 +4755,25 @@ def main():
                 processed_companies,
                 start_card_index=page_start_card,
                 search_url=search_url,
+                missing_card_failure_count=missing_card_failure_count,
             )
 
             all_data.extend(
                 page_data
             )
+
+            if missing_card_failure_count >= 2:
+
+                print()
+                print(
+                    "❌ '몇번째 카드를 찾을 수 없습니다' 오류가 "
+                    "2회 발생하여 검색을 중단합니다."
+                )
+                print(
+                    "지금까지 수집한 정보를 저장하고 앱을 종료합니다."
+                )
+                interrupted = True
+                break
 
             # ------------------------------------------------
             # 통계
